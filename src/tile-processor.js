@@ -1,5 +1,7 @@
 import { padTo8 } from "./utils.js";
 
+const OUTPUT_QUALITY = 96;
+
 function mirrorPad(pixels, srcW, srcH, dstW, dstH) {
   const out = new Uint8ClampedArray(dstW * dstH * 4);
   for (let y = 0; y < dstH; y++) {
@@ -19,95 +21,116 @@ function mirrorPad(pixels, srcW, srcH, dstW, dstH) {
 
 function tileImageData(imageData, sx, sy, sw, sh) {
   const data = new Uint8ClampedArray(sw * sh * 4);
+  const src = imageData.data;
   for (let y = 0; y < sh; y++) {
+    const rowOff = (sy + y) * imageData.width;
+    const diBase = y * sw;
     for (let x = 0; x < sw; x++) {
-      const si = ((sy + y) * imageData.width + (sx + x)) * 4;
-      const di = (y * sw + x) * 4;
-      data[di] = imageData.data[si];
-      data[di + 1] = imageData.data[si + 1];
-      data[di + 2] = imageData.data[si + 2];
-      data[di + 3] = imageData.data[si + 3];
+      const si = (rowOff + sx + x) * 4;
+      const di = (diBase + x) * 4;
+      data[di] = src[si];
+      data[di + 1] = src[si + 1];
+      data[di + 2] = src[si + 2];
+      data[di + 3] = src[si + 3];
     }
   }
   return data;
 }
 
-export async function processTiles(
-  imageData,
-  tileQualities,
-  tileSize,
-  outputQuality,
-  onProgress
-) {
+/**
+ * Group tiles by quality level, batch-encode each group, composite to output.
+ * Returns an OffscreenCanvas with the final composited image.
+ */
+export async function processTiles(imageData, tileQualities, tileSize, onProgress) {
   const { width, height } = imageData;
   const tilesX = Math.ceil(width / tileSize);
   const tilesY = Math.ceil(height / tileSize);
 
-  const srcCanvas = new OffscreenCanvas(width, height);
-  const srcCtx = srcCanvas.getContext("2d");
-  const srcImageData = srcCtx.createImageData(width, height);
-  srcImageData.data.set(imageData.data);
-  srcCtx.putImageData(srcImageData, 0, 0);
+  const srcBitmap = await createImageBitmap(imageData);
 
   const outCanvas = new OffscreenCanvas(width, height);
   const outCtx = outCanvas.getContext("2d");
 
-  let progress = 0;
-  const totalTiles = tilesX * tilesY;
-
-  const tasks = [];
+  const groups = new Map();
+  const edgeTiles = [];
 
   for (let ty = 0; ty < tilesY; ty++) {
     for (let tx = 0; tx < tilesX; tx++) {
+      const tileIdx = ty * tilesX + tx;
+      const q = tileQualities[tileIdx];
       const tileX = tx * tileSize;
       const tileY = ty * tileSize;
       const tileW = Math.min(tileSize, width - tileX);
       const tileH = Math.min(tileSize, height - tileY);
 
-      const tileIdx = ty * tilesX + tx;
-      const tileQuality = tileQualities[tileIdx];
-      const needsEncode = tileQuality < outputQuality;
+      if (q >= OUTPUT_QUALITY) {
+        outCtx.drawImage(srcBitmap, tileX, tileY, tileW, tileH, tileX, tileY, tileW, tileH);
+        continue;
+      }
 
-      tasks.push(async () => {
-        if (needsEncode) {
-          const needPad = tileW < 8 || tileH < 8;
-          if (needPad) {
-            const padded = padTo8(tileW, tileH);
-            const srcPixels = tileImageData(imageData, tileX, tileY, tileW, tileH);
-            const paddedPixels = mirrorPad(srcPixels, tileW, tileH, padded.w, padded.h);
-            const tileCanvas = new OffscreenCanvas(padded.w, padded.h);
-            const tileCtx = tileCanvas.getContext("2d");
-            const id = tileCtx.createImageData(padded.w, padded.h);
-            id.data.set(paddedPixels);
-            tileCtx.putImageData(id, 0, 0);
-            const blob = await tileCanvas.convertToBlob({ type: "image/jpeg", quality: tileQuality / 100 });
-            const bitmap = await createImageBitmap(blob);
-            outCtx.drawImage(bitmap, 0, 0, tileW, tileH, tileX, tileY, tileW, tileH);
-            bitmap.close();
-          } else {
-            const tileCanvas = new OffscreenCanvas(tileW, tileH);
-            const tileCtx = tileCanvas.getContext("2d");
-            tileCtx.drawImage(srcCanvas, tileX, tileY, tileW, tileH, 0, 0, tileW, tileH);
-            const blob = await tileCanvas.convertToBlob({ type: "image/jpeg", quality: tileQuality / 100 });
-            const bitmap = await createImageBitmap(blob);
-            outCtx.drawImage(bitmap, tileX, tileY);
-            bitmap.close();
-          }
-        } else {
-          outCtx.drawImage(srcCanvas, tileX, tileY, tileW, tileH, tileX, tileY, tileW, tileH);
-        }
-
-        progress++;
-        if (onProgress) onProgress(progress, totalTiles);
-      });
+      const tile = { tx, ty, tileX, tileY, tileW, tileH };
+      if (tileW < 8 || tileH < 8) {
+        edgeTiles.push({ ...tile, quality: q });
+      } else {
+        if (!groups.has(q)) groups.set(q, []);
+        groups.get(q).push(tile);
+      }
     }
   }
 
-  const BATCH = 32;
-  for (let i = 0; i < tasks.length; i += BATCH) {
-    const batch = tasks.slice(i, i + BATCH);
-    await Promise.all(batch.map((fn) => fn()));
+  let encodesDone = 0;
+  const totalEncodes = groups.size + edgeTiles.length;
+
+  for (const [quality, tiles] of groups) {
+    const n = tiles.length;
+    const cols = Math.ceil(Math.sqrt(n));
+    const rows = Math.ceil(n / cols);
+    const batchW = cols * tileSize;
+    const batchH = rows * tileSize;
+
+    const batchCanvas = new OffscreenCanvas(batchW, batchH);
+    const batchCtx = batchCanvas.getContext("2d");
+
+    for (let i = 0; i < n; i++) {
+      const t = tiles[i];
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      batchCtx.drawImage(srcBitmap, t.tileX, t.tileY, t.tileW, t.tileH, col * tileSize, row * tileSize, t.tileW, t.tileH);
+    }
+
+    const blob = await batchCanvas.convertToBlob({ type: "image/jpeg", quality: quality / 100 });
+    const bitmap = await createImageBitmap(blob);
+
+    for (let i = 0; i < n; i++) {
+      const t = tiles[i];
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      outCtx.drawImage(bitmap, col * tileSize, row * tileSize, t.tileW, t.tileH, t.tileX, t.tileY, t.tileW, t.tileH);
+    }
+    bitmap.close();
+
+    encodesDone++;
+    if (onProgress) onProgress(`encoding Q${quality} (${encodesDone}/${totalEncodes})`);
   }
 
-  return outCtx.getImageData(0, 0, width, height);
+  for (const t of edgeTiles) {
+    const padded = padTo8(t.tileW, t.tileH);
+    const srcPixels = tileImageData(imageData, t.tileX, t.tileY, t.tileW, t.tileH);
+    const paddedPixels = mirrorPad(srcPixels, t.tileW, t.tileH, padded.w, padded.h);
+    const tileCanvas = new OffscreenCanvas(padded.w, padded.h);
+    const tileCtx = tileCanvas.getContext("2d");
+    const id = tileCtx.createImageData(padded.w, padded.h);
+    id.data.set(paddedPixels);
+    tileCtx.putImageData(id, 0, 0);
+    const blob = await tileCanvas.convertToBlob({ type: "image/jpeg", quality: t.quality / 100 });
+    const bitmap = await createImageBitmap(blob);
+    outCtx.drawImage(bitmap, 0, 0, t.tileW, t.tileH, t.tileX, t.tileY, t.tileW, t.tileH);
+    bitmap.close();
+
+    encodesDone++;
+    if (onProgress) onProgress(`encoding edge tile (${encodesDone}/${totalEncodes})`);
+  }
+
+  srcBitmap.close();
+  return outCanvas;
 }

@@ -1,45 +1,47 @@
-import { MSSS } from "gpu-msss";
-import { TileAnalysisPipeline } from "./tile-analysis.js";
+import { SaliencyPipeline } from "./pipeline.js";
 import { processTiles } from "./tile-processor.js";
 import { autoTileSize } from "./utils.js";
 
-function binarizeMean(pixels, threshold) {
-  const tVal = threshold * 2.55;
-  let sum = 0;
-  const total = pixels.length / 4;
-  for (let i = 0; i < pixels.length; i += 4) {
-    sum += pixels[i] > tVal ? 255 : 0;
-  }
-  return sum / total;
-}
+const OUTPUT_QUALITY = 96;
+const QUALITY_MIN = 64;
+const QUALITY_STEP = 2;
 
-function findOptimalThreshold(rawSaliency, width, height) {
+function findOptimalThreshold(hist, totalPixels) {
   let lower = 0;
   let upper = 100;
   let threshold = 50;
 
-  let mean = binarizeMean(rawSaliency, threshold);
-  let iterations = 0;
+  for (let iter = 0; iter < 20 && lower < upper - 1; iter++) {
+    const tVal = threshold * 2.55;
+    let countAbove = 0;
+    for (let g = Math.ceil(tVal); g < 256; g++) {
+      countAbove += hist[g];
+    }
+    const mean = (255 * countAbove) / totalPixels;
 
-  while ((mean > 40 || mean < 20) && lower < upper - 1 && iterations < 20) {
     if (mean < 20) {
       upper = threshold;
-    } else {
+    } else if (mean > 40) {
       lower = threshold;
+    } else {
+      break;
     }
     threshold = Math.floor((upper - lower) / 2 + lower);
-    mean = binarizeMean(rawSaliency, threshold);
-    iterations++;
   }
 
   return threshold;
 }
 
+function snapQuality(raw) {
+  if (raw >= OUTPUT_QUALITY) return OUTPUT_QUALITY;
+  const clamped = Math.max(QUALITY_MIN, Math.min(OUTPUT_QUALITY - QUALITY_STEP, raw));
+  return Math.round((clamped - QUALITY_MIN) / QUALITY_STEP) * QUALITY_STEP + QUALITY_MIN;
+}
+
 export class AdeptJPEG {
-  constructor(device, msss) {
+  constructor(device) {
     this._device = device;
-    this._msss = msss;
-    this._tileAnalysis = null;
+    this._pipeline = new SaliencyPipeline(device);
   }
 
   static async create() {
@@ -51,59 +53,45 @@ export class AdeptJPEG {
       throw new Error("No WebGPU adapter found");
     }
     const device = await adapter.requestDevice({ requiredLimits: adapter.limits });
-    const msss = new MSSS(device);
-    return new AdeptJPEG(device, msss);
+    return new AdeptJPEG(device);
   }
 
   async compress(imageData, opts = {}) {
-    const { width, height } = imageData;
+    const { width, height, data } = imageData;
     const tileSize = opts.tileSize || autoTileSize(width, height);
-    const inputQuality = opts.inputQuality || 100;
-    const highQuality = opts.highQuality ?? Math.min(inputQuality, 92);
-    const lowQuality = opts.lowQuality ?? 69;
     const onProgress = opts.onProgress || null;
 
     if (onProgress) onProgress("computing saliency");
+    this._pipeline.setup(width, height, tileSize, data);
 
-    const rawSaliency = await this._msss.compute(imageData);
+    const hist = await this._pipeline.computeSaliency();
 
     if (onProgress) onProgress("finding optimal threshold");
-
-    const threshold = findOptimalThreshold(rawSaliency, width, height);
+    const totalPixels = width * height;
+    const threshold = findOptimalThreshold(hist, totalPixels);
 
     if (onProgress) onProgress("analyzing tiles");
-
-    this._tileAnalysis = new TileAnalysisPipeline(this._device, width, height, tileSize);
-    const tileMeans = await this._tileAnalysis.analyze(rawSaliency, threshold * 2.55);
+    const tileMeans = await this._pipeline.analyzeTiles(threshold * 2.55);
 
     if (onProgress) onProgress("encoding tiles");
-
     const tileQualities = new Uint8Array(tileMeans.length);
     let lowComplexityCount = 0;
     for (let i = 0; i < tileMeans.length; i++) {
       const frac = Math.min(1, tileMeans[i] / 255);
-      const q = Math.round(lowQuality + (highQuality - lowQuality) * frac);
-      tileQualities[i] = Math.min(q, highQuality);
-      if (q < highQuality) lowComplexityCount++;
+      const raw = QUALITY_MIN + (OUTPUT_QUALITY - QUALITY_MIN) * frac;
+      tileQualities[i] = snapQuality(raw);
+      if (tileQualities[i] < OUTPUT_QUALITY) lowComplexityCount++;
     }
 
-    const resultData = await processTiles(
+    const outCanvas = await processTiles(
       imageData, tileQualities, tileSize,
-      highQuality,
-      (done, total) => {
-        if (onProgress) onProgress(`encoding tiles (${done}/${total})`);
-      }
+      (msg) => { if (onProgress) onProgress(msg); }
     );
 
-    const outCanvas = new OffscreenCanvas(width, height);
-    const outCtx = outCanvas.getContext("2d");
-    outCtx.putImageData(resultData, 0, 0);
-
     if (onProgress) onProgress("generating output");
-
     const blob = await outCanvas.convertToBlob({
       type: "image/jpeg",
-      quality: highQuality / 100,
+      quality: OUTPUT_QUALITY / 100,
     });
 
     return {
@@ -114,17 +102,13 @@ export class AdeptJPEG {
       tileQualities,
       lowComplexityCount,
       totalTiles: tileMeans.length,
-      highQuality,
-      lowQuality,
+      highQuality: OUTPUT_QUALITY,
+      lowQuality: QUALITY_MIN,
       threshold,
     };
   }
 
   destroy() {
-    if (this._tileAnalysis) {
-      this._tileAnalysis.destroy();
-      this._tileAnalysis = null;
-    }
-    this._msss?.destroy();
+    this._pipeline?.destroy();
   }
 }
