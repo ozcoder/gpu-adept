@@ -22,17 +22,10 @@ function mirrorPad(pixels, srcW, srcH, dstW, dstH) {
 function tileImageData(imageData, sx, sy, sw, sh) {
   const data = new Uint8ClampedArray(sw * sh * 4);
   const src = imageData.data;
+  const rowStride = imageData.width * 4;
   for (let y = 0; y < sh; y++) {
-    const rowOff = (sy + y) * imageData.width;
-    const diBase = y * sw;
-    for (let x = 0; x < sw; x++) {
-      const si = (rowOff + sx + x) * 4;
-      const di = (diBase + x) * 4;
-      data[di] = src[si];
-      data[di + 1] = src[si + 1];
-      data[di + 2] = src[si + 2];
-      data[di + 3] = src[si + 3];
-    }
+    const srcStart = (sy + y) * rowStride + sx * 4;
+    data.set(src.subarray(srcStart, srcStart + sw * 4), y * sw * 4);
   }
   return data;
 }
@@ -80,8 +73,10 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
 
   let encodesDone = 0;
   const totalEncodes = groups.size + edgeTiles.length;
+  const groupEntries = Array.from(groups);
 
-  for (const [quality, tiles] of groups) {
+  for (let gi = 0; gi < groupEntries.length; gi++) {
+    const [quality, tiles] = groupEntries[gi];
     const n = tiles.length;
     const cols = Math.ceil(Math.sqrt(n));
     const rows = Math.ceil(n / cols);
@@ -97,6 +92,9 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
       const row = Math.floor(i / cols);
       batchCtx.drawImage(srcBitmap, t.tileX, t.tileY, t.tileW, t.tileH, col * tileSize, row * tileSize, t.tileW, t.tileH);
     }
+
+    // srcBitmap not needed after the last batch's draw-to-batch-canvas loop
+    if (gi === groupEntries.length - 1) srcBitmap.close();
 
     const blob = await batchCanvas.convertToBlob({ type: "image/jpeg", quality: quality / 100 });
     const bitmap = await createImageBitmap(blob);
@@ -131,6 +129,6 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
     if (onProgress) onProgress(`encoding edge tile (${encodesDone}/${totalEncodes})`);
   }
 
-  srcBitmap.close();
+  if (groupEntries.length === 0) srcBitmap.close();
   return outCanvas;
 }

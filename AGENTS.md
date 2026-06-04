@@ -24,8 +24,8 @@ Browser-only. Uses Vite, WebGPU compute, and Canvas 2D APIs.
                         │
            ┌─ computeSaliency() ──────────────────────┐
            │  RGB→Lab → Gaussian blur → integral      │
-           │  images → saliency → normalize →          │
-           │  histogram (GPU, 256-bin atomic)          │
+           │  images → saliency → normalize +          │
+           │  histogram (GPU, single pass)             │
            └──────────────┬───────────────────────────┘
                           │ readback 1 KB histogram
                           ▼
@@ -74,10 +74,10 @@ Browser-only. Uses Vite, WebGPU compute, and Canvas 2D APIs.
 
 ## Key implementation details
 
-- **Saliency pipeline**: RGB→Lab, 3×3 Gaussian blur, integral images via segmented scan (256-wide segments), saliency = squared Lab difference from local mean, tree-reduction for global min/max, normalize to 0–255.
-- **Histogram**: 256-bin atomic counters on the normalized saliency output. Readback is 1 KB regardless of image size.
+- **Saliency pipeline**: RGB→Lab, 3×3 Gaussian blur, integral images via segmented scan (256-wide segments, **Blelloch parallel scan in shared memory**), saliency = squared Lab difference from local mean, tree-reduction for global min/max, normalize to 0–255 + atomic histogram in a single pass.
+- **Histogram**: 256-bin atomic counters accumulated alongside the normalize pass. Readback is 1 KB regardless of image size.
 - **Binary search**: CPU-side on histogram bins (not full image). Target b/w mean between 20–40 (0–255 scale).
-- **Tile analysis shader**: Workgroup (16,16) = 256 threads per tile. Each thread handles `ceil(tileSize/16)²` pixels. Tree reduction via `var<workgroup>` shared memory.
+- **Tile analysis shader**: Workgroup (8,8) = 64 threads per tile. Each thread handles `ceil(tileSize/8)²` pixels. Vec4 load with per-pixel fallback. Tree reduction via `var<workgroup>` shared memory (64-element sum + count).
 - **Batch encode**: Tiles grouped by quality level. All tiles at the same quality are packed into one OffscreenCanvas → `toBlob` once → decoded → distributed to output. At most 16 encodes for any image size.
 - **Edge tiles**: Tiles < 8px in any dimension are mirror-padded to 8×8 before JPEG encode, cropped after decode. Handled individually (at most `tilesX + tilesY - 1` such tiles).
 - **Quality levels**: 16 discrete levels from 64 to 94 (step 2). Level 96 means "skip encode" — original pixels used directly.

@@ -8,8 +8,6 @@ struct SalParams {
   minVal: f32,
   numSegX: u32,
   numSegY: u32,
-  thresholdLow: f32,
-  thresholdHigh: f32,
 };
 `;
 
@@ -46,6 +44,7 @@ const SAL_BIND = {
   intW3: `@group(0) @binding(3) var<storage, read_write> integral: array<vec4<f32>>;`,
   sHw3:  `@group(0) @binding(3) var<storage, read_write> segSumsH: array<vec4<f32>>;`,
   sal3:  `@group(0) @binding(3) var<storage, read_write> saliency: array<f32>;`,
+  hist3: `@group(0) @binding(3) var<storage, read_write> hist: array<atomic<u32>>;`,
 
   // segment scan
   sHsc: `@group(0) @binding(1) var<storage, read_write> segSumsH: array<vec4<f32>>;`,
@@ -143,19 +142,61 @@ ${SAL_BIND.lab}
 ${SAL_BIND.intW2}
 ${SAL_BIND.sHw3}
 
-@compute @workgroup_size(1, 1)
-fn integralH(@builtin(workgroup_id) wg: vec3<u32>) {
+@compute @workgroup_size(256, 1)
+fn integralH(
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wg: vec3<u32>,
+) {
   let row = wg.y;
   let seg = wg.x;
   let segStart = seg * 256u;
   let segEnd   = min(segStart + 256u, p.width);
   let segLen   = segEnd - segStart;
-  var sum = vec4(0.0);
-  for (var i = 0u; i < segLen; i++) {
-    sum += lab[row * p.width + segStart + i];
-    integral[row * p.width + segStart + i] = sum;
+  let idx = lid.x;
+
+  var shOrig: array<vec4<f32>, 256>;
+  var shScan: array<vec4<f32>, 256>;
+
+  shOrig[idx] = select(vec4(0.0), lab[row * p.width + segStart + idx], idx < segLen);
+  shScan[idx] = shOrig[idx];
+  workgroupBarrier();
+
+  // Up-sweep
+  for (var d = 0u; d < 8u; d = d + 1u) {
+    let stride = 1u << (d + 1u);
+    let half = stride >> 1u;
+    if ((idx + 1u) % stride == 0u) {
+      shScan[idx] = shScan[idx - half] + shScan[idx];
+    }
+    workgroupBarrier();
   }
-  segSumsH[row * p.numSegX + seg] = sum;
+
+  if (idx == 255u) {
+    shScan[idx] = vec4(0.0);
+  }
+  workgroupBarrier();
+
+  // Down-sweep
+  for (var d = 8u; d > 0u; d = d - 1u) {
+    let d2 = d - 1u;
+    let stride = 1u << (d2 + 1u);
+    let half = stride >> 1u;
+    if ((idx + 1u) % stride == 0u) {
+      let tmp = shScan[idx - half];
+      shScan[idx - half] = shScan[idx];
+      shScan[idx] = tmp + shScan[idx];
+    }
+    workgroupBarrier();
+  }
+
+  // Exclusive → inclusive by adding original
+  if (idx < segLen) {
+    integral[row * p.width + segStart + idx] = shScan[idx] + shOrig[idx];
+  }
+  if (idx == 0u) {
+    let lastIdx = select(0u, segLen - 1u, segLen > 0u);
+    segSumsH[row * p.numSegX + seg] = shOrig[lastIdx] + shScan[lastIdx];
+  }
 }
 `;
 
@@ -204,19 +245,58 @@ ${SAL_BIND.p}
 ${SAL_BIND.intW}
 ${SAL_BIND.sVw}
 
-@compute @workgroup_size(1, 1)
-fn integralV(@builtin(workgroup_id) wg: vec3<u32>) {
+@compute @workgroup_size(1, 256)
+fn integralV(
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wg: vec3<u32>,
+) {
   let col = wg.x;
   let seg = wg.y;
   let segStart = seg * 256u;
   let segEnd   = min(segStart + 256u, p.height);
   let segLen   = segEnd - segStart;
-  var sum = vec4(0.0);
-  for (var i = 0u; i < segLen; i++) {
-    sum += integral[(segStart + i) * p.width + col];
-    integral[(segStart + i) * p.width + col] = sum;
+  let idx = lid.y;
+
+  var shOrig: array<vec4<f32>, 256>;
+  var shScan: array<vec4<f32>, 256>;
+
+  shOrig[idx] = select(vec4(0.0), integral[(segStart + idx) * p.width + col], idx < segLen);
+  shScan[idx] = shOrig[idx];
+  workgroupBarrier();
+
+  for (var d = 0u; d < 8u; d = d + 1u) {
+    let stride = 1u << (d + 1u);
+    let half = stride >> 1u;
+    if ((idx + 1u) % stride == 0u) {
+      shScan[idx] = shScan[idx - half] + shScan[idx];
+    }
+    workgroupBarrier();
   }
-  segSumsV[col * p.numSegY + seg] = sum;
+
+  if (idx == 255u) {
+    shScan[idx] = vec4(0.0);
+  }
+  workgroupBarrier();
+
+  for (var d = 8u; d > 0u; d = d - 1u) {
+    let d2 = d - 1u;
+    let stride = 1u << (d2 + 1u);
+    let half = stride >> 1u;
+    if ((idx + 1u) % stride == 0u) {
+      let tmp = shScan[idx - half];
+      shScan[idx - half] = shScan[idx];
+      shScan[idx] = tmp + shScan[idx];
+    }
+    workgroupBarrier();
+  }
+
+  if (idx < segLen) {
+    integral[(segStart + idx) * p.width + col] = shScan[idx] + shOrig[idx];
+  }
+  if (idx == 0u) {
+    let lastIdx = select(0u, segLen - 1u, segLen > 0u);
+    segSumsV[col * p.numSegY + seg] = shOrig[lastIdx] + shScan[lastIdx];
+  }
 }
 `;
 
@@ -329,45 +409,23 @@ fn reduceMax(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoca
 }
 `;
 
-export const NORMALIZE = `
+export const NORMALIZE_HIST = `
 ${SAL_STRUCT}
 ${SAL_BIND.p}
 ${SAL_BIND.sal}
 ${SAL_BIND.out2}
+${SAL_BIND.hist3}
 
 @compute @workgroup_size(16, 16)
-fn normalize(@builtin(global_invocation_id) id: vec3<u32>) {
+fn normalizeHist(@builtin(global_invocation_id) id: vec3<u32>) {
   let x = id.x;
   let y = id.y;
   if (x >= p.width || y >= p.height) { return; }
   let idx = y * p.width + x;
   let range = p.maxVal - p.minVal;
   let s = select(0.0, (saliency[idx] - p.minVal) / range, range > 0.0);
-  let clamped = clamp(s * 255.0, 0.0, 255.0);
-  let val = u32(clamped);
+  let val = u32(clamp(s * 255.0, 0.0, 255.0));
   output[idx] = val | (val << 8u) | (val << 16u) | (255u << 24u);
-}
-`;
-
-// ── Histogram ────────────────────────────────────────────────────────
-
-const HIST_STRUCT = `
-struct HistParams {
-  pixelCount: u32,
-};
-`;
-
-export const HISTOGRAM = `
-${HIST_STRUCT}
-
-@group(0) @binding(0) var<uniform> hp: HistParams;
-@group(0) @binding(1) var<storage, read> src: array<u32>;
-@group(0) @binding(2) var<storage, read_write> hist: array<atomic<u32>>;
-
-@compute @workgroup_size(256)
-fn histogram(@builtin(global_invocation_id) id: vec3<u32>) {
-  if (id.x >= hp.pixelCount) { return; }
-  let val = src[id.x] & 0xFFu;
   atomicAdd(&hist[val], 1u);
 }
 `;
@@ -392,18 +450,18 @@ ${TILE_STRUCT}
 @group(0) @binding(1) var<storage, read> saliency: array<u32>;
 @group(0) @binding(2) var<storage, read_write> tileMeans: array<f32>;
 
-var<workgroup> wgSum: array<f32, 256>;
-var<workgroup> wgCnt: array<u32, 256>;
+var<workgroup> wgSum: array<f32, 64>;
+var<workgroup> wgCnt: array<u32, 64>;
 
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(8, 8)
 fn tileAnalysis(
   @builtin(workgroup_id) wgId: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   if (wgId.x >= tp.tilesX || wgId.y >= tp.tilesY) { return; }
 
-  let blockW = (tp.tileSize + 15u) / 16u;
-  let blockH = (tp.tileSize + 15u) / 16u;
+  let blockW = (tp.tileSize + 7u) / 8u;
+  let blockH = (tp.tileSize + 7u) / 8u;
   let baseX = wgId.x * tp.tileSize;
   let baseY = wgId.y * tp.tileSize;
 
@@ -411,24 +469,41 @@ fn tileAnalysis(
   var cnt = 0u;
 
   for (var dy = 0u; dy < blockH; dy++) {
-    for (var dx = 0u; dx < blockW; dx++) {
-      let px = baseX + lid.x * blockW + dx;
-      let py = baseY + lid.y * blockH + dy;
-      if (px < tp.imgW && py < tp.imgH) {
-        let gray = f32(saliency[py * tp.imgW + px] & 0xFFu);
-        let bw = select(0.0, 255.0, gray > tp.threshold);
-        sum += bw;
-        cnt++;
+    let py = baseY + lid.y * blockH + dy;
+    if (py >= tp.imgH) { continue; }
+    for (var gx = 0u; gx < blockW; gx += 4u) {
+      let px0 = baseX + lid.x * blockW + gx;
+      if (gx + 4u <= blockW && px0 + 4u <= tp.imgW) {
+        // Vec4 load: 4 consecutive owned pixels, all in-bounds
+        let v0 = saliency[py * tp.imgW + px0];
+        let v1 = saliency[py * tp.imgW + px0 + 1u];
+        let v2 = saliency[py * tp.imgW + px0 + 2u];
+        let v3 = saliency[py * tp.imgW + px0 + 3u];
+        let r = vec4<f32>(f32(v0 & 0xFFu), f32(v1 & 0xFFu), f32(v2 & 0xFFu), f32(v3 & 0xFFu));
+        let bw = select(vec4<f32>(0.0), vec4<f32>(255.0), r > vec4<f32>(tp.threshold));
+        sum += bw.x + bw.y + bw.z + bw.w;
+        cnt += 4u;
+      } else {
+        // Per-pixel fallback for partial group or image edge
+        for (var i = 0u; i < 4u; i++) {
+          let px = px0 + i;
+          if (px < tp.imgW && gx + i < blockW) {
+            let gray = f32(saliency[py * tp.imgW + px] & 0xFFu);
+            let bw = select(0.0, 255.0, gray > tp.threshold);
+            sum += bw;
+            cnt++;
+          }
+        }
       }
     }
   }
 
-  let tid = lid.y * 16u + lid.x;
+  let tid = lid.y * 8u + lid.x;
   wgSum[tid] = sum;
   wgCnt[tid] = cnt;
   workgroupBarrier();
 
-  var s = 128u;
+  var s = 32u;
   while (s > 0u) {
     if (tid < s) {
       wgSum[tid] = wgSum[tid] + wgSum[tid + s];

@@ -2,8 +2,8 @@ import {
   RGB2LAB, GAUSSIAN_X, GAUSSIAN_Y,
   INTEGRAL_H, INTEGRAL_H_FIXUP, SEG_SCAN_H,
   INTEGRAL_V, INTEGRAL_V_FIXUP, SEG_SCAN_V,
-  SALIENCY, REDUCE_MAX, NORMALIZE,
-  HISTOGRAM, TILE_ANALYSIS,
+  SALIENCY, REDUCE_MAX, NORMALIZE_HIST,
+  TILE_ANALYSIS,
 } from './shaders.js';
 
 const makePipeline = (device, code, entry) => {
@@ -39,8 +39,7 @@ export class SaliencyPipeline {
       segScanV:      makePipeline(device, SEG_SCAN_V,    'segScanV'),
       saliency:      makePipeline(device, SALIENCY,      'computeSaliency'),
       reduceMax:     makePipeline(device, REDUCE_MAX,    'reduceMax'),
-      normalize:     makePipeline(device, NORMALIZE,     'normalize'),
-      histogram:     makePipeline(device, HISTOGRAM,     'histogram'),
+      normalizeHist: makePipeline(device, NORMALIZE_HIST,'normalizeHist'),
       tileAnalysis:  makePipeline(device, TILE_ANALYSIS, 'tileAnalysis'),
     };
     this._bgCache = {};
@@ -67,18 +66,16 @@ export class SaliencyPipeline {
 
     const S = GPUBufferUsage;
 
-    /* ─── Saliency params storage buffer (32 bytes, matches SAL_STRUCT) ─── */
-    this._salRaw = new ArrayBuffer(32);
+    /* ─── Saliency params storage buffer (24 bytes, matches SAL_STRUCT) ─── */
+    this._salRaw = new ArrayBuffer(24);
     wu32(this._salRaw, 0, width);
     wu32(this._salRaw, 4, height);
     wf32(this._salRaw, 8, 0);   // maxVal (filled later)
     wf32(this._salRaw, 12, 0);  // minVal (filled later)
     wu32(this._salRaw, 16, numSegX);
     wu32(this._salRaw, 20, numSegY);
-    wf32(this._salRaw, 24, 0);  // thresholdLow (unused)
-    wf32(this._salRaw, 28, 0);  // thresholdHigh (unused)
     this.salParamsBuf = device.createBuffer({
-      size: 32, usage: S.STORAGE | S.COPY_DST,
+      size: 24, usage: S.STORAGE | S.COPY_DST,
     });
 
     /* ─── Input RGBA (u32) ─── */
@@ -139,13 +136,6 @@ export class SaliencyPipeline {
       size: 32, usage: S.UNIFORM | S.COPY_DST,
     });
 
-    /* ─── Histogram params uniform buffer (16 bytes — WGSL uniform minimum) ─── */
-    this._histRaw = new ArrayBuffer(16);
-    wu32(this._histRaw, 0, pixelCount);
-    this.histParamsBuf = device.createBuffer({
-      size: 16, usage: S.UNIFORM | S.COPY_DST,
-    });
-
     /* ─── Staging buffers ─── */
     this.maxValsStaging = device.createBuffer({
       size: this._maxWgCount * 8, usage: S.MAP_READ | S.COPY_DST,
@@ -172,10 +162,6 @@ export class SaliencyPipeline {
     this.device.queue.writeBuffer(this.tileParamsBuf, 0, this._tileRaw);
   }
 
-  _writeHistParams() {
-    this.device.queue.writeBuffer(this.histParamsBuf, 0, this._histRaw);
-  }
-
   /* ─────────── Bind group helpers ─────────── */
 
   _bg(name, entries) {
@@ -190,13 +176,13 @@ export class SaliencyPipeline {
   async computeSaliency() {
     const device = this.device;
     const W = this._width, H = this._height;
-    const pc = this._pixelCount;
     const nX = this._numSegX;
     const nY = this._numSegY;
     const mW = this._maxWgCount;
+    const gX = Math.ceil(W / 16);
+    const gY = Math.ceil(H / 16);
 
     this._writeSalParams();
-    this._writeHistParams();
 
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -210,7 +196,7 @@ export class SaliencyPipeline {
       { binding: 1, resource: { buffer: this.inputBuf } },
       { binding: 2, resource: { buffer: this.labBuf } },
     ]));
-    pass.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
+    pass.dispatchWorkgroups(gX, gY);
 
     // Gaussian X
     pass.setPipeline(P.gaussianX);
@@ -219,7 +205,7 @@ export class SaliencyPipeline {
       { binding: 1, resource: { buffer: this.labBuf } },
       { binding: 2, resource: { buffer: this.tempBuf } },
     ]));
-    pass.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
+    pass.dispatchWorkgroups(gX, gY);
 
     // Gaussian Y
     pass.setPipeline(P.gaussianY);
@@ -228,7 +214,7 @@ export class SaliencyPipeline {
       { binding: 1, resource: { buffer: this.tempBuf } },
       { binding: 2, resource: { buffer: this.blurBuf } },
     ]));
-    pass.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
+    pass.dispatchWorkgroups(gX, gY);
 
     // Integral H
     pass.setPipeline(P.integralH);
@@ -291,7 +277,7 @@ export class SaliencyPipeline {
       { binding: 2, resource: { buffer: this.intBuf } },
       { binding: 3, resource: { buffer: this.saliencyBuf } },
     ]));
-    pass.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
+    pass.dispatchWorkgroups(gX, gY);
 
     // Reduce max/min
     pass.setPipeline(P.reduceMax);
@@ -322,25 +308,18 @@ export class SaliencyPipeline {
     wf32(this._salRaw, 12, gMin);
     this._writeSalParams();
 
-    // Second pass: normalize + histogram
+    // Second pass: normalize + histogram (single dispatch)
     const enc2 = device.createCommandEncoder();
     const pass2 = enc2.beginComputePass();
 
-    pass2.setPipeline(P.normalize);
-    pass2.setBindGroup(0, bg('normalize', [
+    pass2.setPipeline(P.normalizeHist);
+    pass2.setBindGroup(0, bg('normalizeHist', [
       { binding: 0, resource: { buffer: this.salParamsBuf } },
       { binding: 1, resource: { buffer: this.saliencyBuf } },
       { binding: 2, resource: { buffer: this.outputBuf } },
+      { binding: 3, resource: { buffer: this.histBuf } },
     ]));
-    pass2.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
-
-    pass2.setPipeline(P.histogram);
-    pass2.setBindGroup(0, bg('histogram', [
-      { binding: 0, resource: { buffer: this.histParamsBuf } },
-      { binding: 1, resource: { buffer: this.outputBuf } },
-      { binding: 2, resource: { buffer: this.histBuf } },
-    ]));
-    pass2.dispatchWorkgroups(Math.ceil(pc / 256));
+    pass2.dispatchWorkgroups(gX, gY);
 
     pass2.end();
     enc2.copyBufferToBuffer(this.histBuf, 0, this.histStaging, 0, 1024);
@@ -403,7 +382,7 @@ export class SaliencyPipeline {
       this.saliencyBuf, this.maxValsBuf,
       this.segSumsHBuf, this.segSumsVBuf,
       this.outputBuf, this.histBuf, this.tileMeansBuf,
-      this.tileParamsBuf, this.histParamsBuf,
+      this.tileParamsBuf,
       this.maxValsStaging, this.histStaging, this.tileMeansStaging,
       this.outputStaging,
     ];
