@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gpu-adept</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    p.sub { color: #888; margin-bottom: 2rem; font-size: 0.875rem; }
+    #drop-zone {
+      width: 100%;
+      max-width: 640px;
+      border: 2px dashed #444;
+      border-radius: 12px;
+      padding: 3rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    #drop-zone.dragover { border-color: #4af; background: #1a2a3a; }
+    #drop-zone.has-image { border-color: #4a4; }
+    #preview { display: none; max-width: 100%; max-height: 60vh; margin-top: 1.5rem; border-radius: 8px; }
+    #controls { display: none; margin-top: 1.5rem; gap: 1rem; align-items: center; flex-wrap: wrap; justify-content: center; }
+    #controls.visible { display: flex; }
+    button {
+      padding: 0.625rem 1.5rem;
+      border: none;
+      border-radius: 8px;
+      background: #4af;
+      color: #fff;
+      font-size: 0.9375rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #38d; }
+    button:disabled { background: #444; cursor: not-allowed; }
+    #status { margin-top: 1rem; font-size: 0.875rem; color: #aaa; }
+    #result { display: none; margin-top: 1.5rem; max-width: 100%; }
+    #result.visible { display: block; }
+    #result img { max-width: 100%; max-height: 60vh; border-radius: 8px; }
+    .stats { margin-top: 0.5rem; font-size: 0.8125rem; color: #888; display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    #debug-table { display: none; margin-top: 1.5rem; overflow-x: auto; }
+    #debug-table.visible { display: block; }
+    #debug-table table { border-collapse: collapse; font-size: 0.6875rem; font-family: monospace; }
+    #debug-table td {
+      border: 1px solid #333;
+      padding: 2px 4px;
+      text-align: center;
+      min-width: 28px;
+    }
+    #debug-table td.low { background: #1a3a1a; color: #6c6; }
+    #debug-table td.high { background: #2a1a1a; color: #c66; }
+    #debug-table td.edge { color: #666; }
+    .checkbox-label { display: flex; align-items: center; gap: 0.375rem; font-size: 0.875rem; cursor: pointer; }
+    .checkbox-label input { accent-color: #4af; }
+  </style>
+</head>
+<body>
+  <h1>gpu-adept</h1>
+  <p class="sub">Adaptive JPEG compression via WebGPU</p>
+
+  <div id="drop-zone">
+    <p>Drop an image here, or click to select</p>
+    <input type="file" id="file-input" accept="image/*" hidden />
+  </div>
+
+  <img id="preview" alt="preview" />
+
+  <div id="controls">
+    <button id="compress-btn" disabled>Compress</button>
+    <label>
+      Tile size:
+      <select id="tile-size">
+        <option value="auto" selected>Auto</option>
+        <option value="8">8×8</option>
+        <option value="16">16×16</option>
+        <option value="32">32×32</option>
+        <option value="64">64×64</option>
+        <option value="128">128×128</option>
+        <option value="256">256×256</option>
+      </select>
+    </label>
+    <label class="checkbox-label">
+      <input type="checkbox" id="debug-check" />
+      Debug
+    </label>
+  </div>
+
+  <div id="status"></div>
+
+  <div id="result">
+    <img id="result-img" alt="result" />
+    <div class="stats">
+      <span id="stat-original"></span>
+      <span id="stat-compressed"></span>
+      <span id="stat-ratio"></span>
+    </div>
+    <button id="download-btn" style="margin-top:0.75rem">Download JPEG</button>
+  </div>
+
+  <div id="debug-table"></div>
+
+  <script type="module" src="/demo/demo.js"></script>
+</body>
+</html>
