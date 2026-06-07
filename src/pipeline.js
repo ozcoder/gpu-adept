@@ -2,7 +2,7 @@ import {
   RGB2LAB, GAUSSIAN_X, GAUSSIAN_Y,
   INTEGRAL_H, INTEGRAL_H_FIXUP, SEG_SCAN_H,
   INTEGRAL_V, INTEGRAL_V_FIXUP, SEG_SCAN_V,
-  SALIENCY, REDUCE_MAX, NORMALIZE_HIST,
+  SALIENCY, NORMALIZE_HIST,
   TILE_ANALYSIS,
 } from './shaders.js';
 
@@ -38,7 +38,6 @@ export class SaliencyPipeline {
       integralVFixup:makePipeline(device, INTEGRAL_V_FIXUP, 'integralVFixup'),
       segScanV:      makePipeline(device, SEG_SCAN_V,    'segScanV'),
       saliency:      makePipeline(device, SALIENCY,      'computeSaliency'),
-      reduceMax:     makePipeline(device, REDUCE_MAX,    'reduceMax'),
       normalizeHist: makePipeline(device, NORMALIZE_HIST,'normalizeHist'),
       tileAnalysis:  makePipeline(device, TILE_ANALYSIS, 'tileAnalysis'),
     };
@@ -51,31 +50,44 @@ export class SaliencyPipeline {
     const pixelCount = width * height;
     const numSegX = Math.max(1, Math.ceil(width / 256));
     const numSegY = Math.max(1, Math.ceil(height / 256));
-    const tilesX = Math.ceil(width / tileSize);
-    const tilesY = Math.ceil(height / tileSize);
+    const analysisTileSize = 8;
+    const tilesX = Math.ceil(width / analysisTileSize);
+    const tilesY = Math.ceil(height / analysisTileSize);
 
     this._width = width;
     this._height = height;
     this._pixelCount = pixelCount;
-    this._tileSize = tileSize;
+    this._tileSize = analysisTileSize;
     this._tilesX = tilesX;
     this._tilesY = tilesY;
     this._numSegX = numSegX;
     this._numSegY = numSegY;
-    this._maxWgCount = Math.ceil(pixelCount / 256);
+    const maxBuf = device.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    const maxAlign = Math.max(256, device.limits.maxBufferSize ?? maxBuf);
+    const floatSz = pixelCount * 16;
+    if (floatSz > maxBuf) {
+      throw new Error(
+        `Image too large for this device: vec4<f32> buffer needs ` +
+        `${(floatSz / 1024 / 1024).toFixed(1)} MB (${width}×${height}), ` +
+        `maxStorageBufferBindingSize is ${(maxBuf / 1024 / 1024).toFixed(1)} MB`
+      );
+    }
+    if (floatSz > maxAlign) {
+      throw new Error(
+        `Image too large for this device: ${(floatSz / 1024 / 1024).toFixed(1)} MB exceeds maxBufferSize`
+      );
+    }
 
     const S = GPUBufferUsage;
 
-    /* ─── Saliency params storage buffer (24 bytes, matches SAL_STRUCT) ─── */
-    this._salRaw = new ArrayBuffer(24);
+    /* ─── Saliency params storage buffer (16 bytes, matches SAL_STRUCT) ─── */
+    this._salRaw = new ArrayBuffer(16);
     wu32(this._salRaw, 0, width);
     wu32(this._salRaw, 4, height);
-    wf32(this._salRaw, 8, 0);   // maxVal (filled later)
-    wf32(this._salRaw, 12, 0);  // minVal (filled later)
-    wu32(this._salRaw, 16, numSegX);
-    wu32(this._salRaw, 20, numSegY);
+    wu32(this._salRaw, 8, numSegX);
+    wu32(this._salRaw, 12, numSegY);
     this.salParamsBuf = device.createBuffer({
-      size: 24, usage: S.STORAGE | S.COPY_DST,
+      size: 16, usage: S.STORAGE | S.COPY_DST,
     });
 
     /* ─── Input RGBA (u32) ─── */
@@ -85,7 +97,6 @@ export class SaliencyPipeline {
     device.queue.writeBuffer(this.inputBuf, 0, initialData);
 
     /* ─── Working float buffers (vec4<f32> per pixel) ─── */
-    const floatSz = pixelCount * 16;
     this.labBuf  = device.createBuffer({ size: floatSz, usage: S.STORAGE });
     this.tempBuf = device.createBuffer({ size: floatSz, usage: S.STORAGE });
     this.blurBuf = device.createBuffer({ size: floatSz, usage: S.STORAGE });
@@ -96,10 +107,12 @@ export class SaliencyPipeline {
       size: pixelCount * 4, usage: S.STORAGE,
     });
 
-    /* ─── Max reduction output (vec2<f32> per workgroup) ─── */
-    this.maxValsBuf = device.createBuffer({
-      size: this._maxWgCount * 8, usage: S.STORAGE | S.COPY_SRC,
+    /* ─── Global min/max (atomic<u32>[2]) ─── */
+    this.globalMinMaxBuf = device.createBuffer({
+      size: 8, usage: S.STORAGE | S.COPY_DST,
     });
+    const initMM = new Uint32Array([0x7F7FFFFF, 0]);
+    device.queue.writeBuffer(this.globalMinMaxBuf, 0, initMM);
 
     /* ─── Segment sum buffers (vec4<f32> per segment) ─── */
     this.segSumsHBuf = device.createBuffer({
@@ -128,7 +141,7 @@ export class SaliencyPipeline {
     this._tileRaw = new ArrayBuffer(32);
     wu32(this._tileRaw, 0, width);
     wu32(this._tileRaw, 4, height);
-    wu32(this._tileRaw, 8, tileSize);
+    wu32(this._tileRaw, 8, analysisTileSize);
     wu32(this._tileRaw, 12, tilesX);
     wu32(this._tileRaw, 16, tilesY);
     wf32(this._tileRaw, 20, 0);  // threshold (set later)
@@ -137,9 +150,6 @@ export class SaliencyPipeline {
     });
 
     /* ─── Staging buffers ─── */
-    this.maxValsStaging = device.createBuffer({
-      size: this._maxWgCount * 8, usage: S.MAP_READ | S.COPY_DST,
-    });
     this.histStaging = device.createBuffer({
       size: 1024, usage: S.MAP_READ | S.COPY_DST,
     });
@@ -178,9 +188,11 @@ export class SaliencyPipeline {
     const W = this._width, H = this._height;
     const nX = this._numSegX;
     const nY = this._numSegY;
-    const mW = this._maxWgCount;
     const gX = Math.ceil(W / 16);
     const gY = Math.ceil(H / 16);
+
+    // Reset global min/max atomics
+    device.queue.writeBuffer(this.globalMinMaxBuf, 0, new Uint32Array([0x7F7FFFFF, 0]));
 
     this._writeSalParams();
 
@@ -198,7 +210,7 @@ export class SaliencyPipeline {
     ]));
     pass.dispatchWorkgroups(gX, gY);
 
-    // Gaussian X
+    // Gaussian blur X → tempBuf
     pass.setPipeline(P.gaussianX);
     pass.setBindGroup(0, bg('gaussianX', [
       { binding: 0, resource: { buffer: this.salParamsBuf } },
@@ -207,7 +219,7 @@ export class SaliencyPipeline {
     ]));
     pass.dispatchWorkgroups(gX, gY);
 
-    // Gaussian Y
+    // Gaussian blur Y → blurBuf
     pass.setPipeline(P.gaussianY);
     pass.setBindGroup(0, bg('gaussianY', [
       { binding: 0, resource: { buffer: this.salParamsBuf } },
@@ -269,61 +281,31 @@ export class SaliencyPipeline {
     ]));
     pass.dispatchWorkgroups(W, nY);
 
-    // Saliency
+    // Saliency (writes pixel values + atomic min/max)
     pass.setPipeline(P.saliency);
     pass.setBindGroup(0, bg('saliency', [
       { binding: 0, resource: { buffer: this.salParamsBuf } },
       { binding: 1, resource: { buffer: this.blurBuf } },
       { binding: 2, resource: { buffer: this.intBuf } },
       { binding: 3, resource: { buffer: this.saliencyBuf } },
+      { binding: 4, resource: { buffer: this.globalMinMaxBuf } },
     ]));
     pass.dispatchWorkgroups(gX, gY);
 
-    // Reduce max/min
-    pass.setPipeline(P.reduceMax);
-    pass.setBindGroup(0, bg('reduceMax', [
-      { binding: 0, resource: { buffer: this.salParamsBuf } },
-      { binding: 1, resource: { buffer: this.saliencyBuf } },
-      { binding: 2, resource: { buffer: this.maxValsBuf } },
-    ]));
-    pass.dispatchWorkgroups(mW);
-
-    pass.end();
-    enc.copyBufferToBuffer(this.maxValsBuf, 0, this.maxValsStaging, 0, mW * 8);
-    device.queue.submit([enc.finish()]);
-
-    // Read back min/max
-    await this.maxValsStaging.mapAsync(GPUMapMode.READ);
-    const maxRaw = new Float32Array(this.maxValsStaging.getMappedRange());
-    let gMin = Infinity, gMax = -Infinity;
-    for (let i = 0; i < mW; i++) {
-      const mn = maxRaw[i * 2], mx = maxRaw[i * 2 + 1];
-      if (mn < gMin) gMin = mn;
-      if (mx > gMax) gMax = mx;
-    }
-    this.maxValsStaging.unmap();
-
-    // Update saliency params with computed min/max
-    wf32(this._salRaw, 8, gMax);
-    wf32(this._salRaw, 12, gMin);
-    this._writeSalParams();
-
-    // Second pass: normalize + histogram (single dispatch)
-    const enc2 = device.createCommandEncoder();
-    const pass2 = enc2.beginComputePass();
-
-    pass2.setPipeline(P.normalizeHist);
-    pass2.setBindGroup(0, bg('normalizeHist', [
+    // Normalize + histogram (reads atomic min/max)
+    pass.setPipeline(P.normalizeHist);
+    pass.setBindGroup(0, bg('normalizeHist', [
       { binding: 0, resource: { buffer: this.salParamsBuf } },
       { binding: 1, resource: { buffer: this.saliencyBuf } },
       { binding: 2, resource: { buffer: this.outputBuf } },
       { binding: 3, resource: { buffer: this.histBuf } },
+      { binding: 4, resource: { buffer: this.globalMinMaxBuf } },
     ]));
-    pass2.dispatchWorkgroups(gX, gY);
+    pass.dispatchWorkgroups(gX, gY);
 
-    pass2.end();
-    enc2.copyBufferToBuffer(this.histBuf, 0, this.histStaging, 0, 1024);
-    device.queue.submit([enc2.finish()]);
+    pass.end();
+    enc.copyBufferToBuffer(this.histBuf, 0, this.histStaging, 0, 1024);
+    device.queue.submit([enc.finish()]);
 
     await this.histStaging.mapAsync(GPUMapMode.READ);
     const hist = new Uint32Array(this.histStaging.getMappedRange()).slice();
@@ -379,11 +361,11 @@ export class SaliencyPipeline {
     const bufs = [
       this.salParamsBuf, this.inputBuf,
       this.labBuf, this.tempBuf, this.blurBuf, this.intBuf,
-      this.saliencyBuf, this.maxValsBuf,
+      this.saliencyBuf, this.globalMinMaxBuf,
       this.segSumsHBuf, this.segSumsVBuf,
       this.outputBuf, this.histBuf, this.tileMeansBuf,
       this.tileParamsBuf,
-      this.maxValsStaging, this.histStaging, this.tileMeansStaging,
+      this.histStaging, this.tileMeansStaging,
       this.outputStaging,
     ];
     for (const b of bufs) {

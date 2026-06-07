@@ -1,5 +1,5 @@
 import { AdeptJPEG } from "../src/adept.js";
-import { imageDataFromFile, downloadBlob, autoTileSize } from "../src/utils.js";
+import { imageDataFromFile, downloadBlob } from "../src/utils.js";
 
 const dropZone = document.getElementById("drop-zone");
 const fileInput = document.getElementById("file-input");
@@ -77,9 +77,7 @@ compressBtn.addEventListener("click", async () => {
     }
 
     let tileSize = tileSizeSelect.value;
-    if (tileSize === "auto") {
-      tileSize = autoTileSize(currentImageData.width, currentImageData.height);
-    } else {
+    if (tileSize !== "auto") {
       tileSize = parseInt(tileSize, 10);
     }
 
@@ -104,12 +102,14 @@ compressBtn.addEventListener("click", async () => {
     const ratio = ((1 - compressedSize / originalSize) * 100).toFixed(1);
 
     statOriginal.textContent = `Original: ${formatSize(originalSize)}`;
-    const pctLow = ((info.lowComplexityCount / info.totalTiles) * 100).toFixed(0);
+    const pctLow = ((info.lowComplexityCount / info.totalLeaves) * 100).toFixed(0);
+    const sc = info.sizeCounts;
+    const tileDesc = tileSize === "auto"
+      ? `${info.totalLeaves} adaptive leaves (${sc[32] || 0}×32, ${sc[16] || 0}×16, ${sc[8] || 0}×8)`
+      : `${info.totalLeaves} uniform ${tileSize}×${tileSize} tiles`;
     statCompressed.textContent =
-      `${info.tileSize}×${info.tileSize} tiles · ` +
-      `${info.tilesX}×${info.tilesY} grid · ` +
-      `${pctLow}% tiles @ Q${info.lowQuality} (low-complexity), ` +
-      `rest kept original · output @ Q${info.highQuality} · ` +
+      `${tileDesc} · ` +
+      `${pctLow}% @ Q${info.lowQuality} · output @ Q${info.highQuality} · ` +
       `${formatSize(compressedSize)}`;
     statRatio.textContent = `Saved: ${ratio}%`;
 
@@ -174,18 +174,36 @@ async function detectJPEGQuality(file) {
 
 function renderDebugTable(info) {
   debugTable.classList.add("visible");
-  const qs = info.tileQualities;
-  const cols = info.tilesX;
-  const rows = info.tilesY;
   const mask = info.lowQuality;
+  const preview = document.getElementById("preview");
+  const W = preview.naturalWidth;
+  const H = preview.naturalHeight;
+
+  // Group leaves by 8×8 cell to render a coarse visualization.
+  const cell = 32;
+  const cols = Math.ceil(W / cell);
+  const rows = Math.ceil(H / cell);
+  const cellQs = new Array(cols * rows).fill(null);
+  for (const leaf of info.leaves) {
+    const cx = Math.floor(leaf.x / cell);
+    const cy = Math.floor(leaf.y / cell);
+    const idx = cy * cols + cx;
+    if (cellQs[idx] === null || leaf.quality < cellQs[idx]) {
+      cellQs[idx] = leaf.quality;
+    }
+  }
 
   let html = "<table>";
   for (let r = 0; r < rows; r++) {
     html += "<tr>";
     for (let c = 0; c < cols; c++) {
-      const q = qs[r * cols + c];
-      const cls = q === mask ? "low" : "high";
-      html += `<td class="${cls}">${q}</td>`;
+      const q = cellQs[r * cols + c];
+      if (q === null) {
+        html += `<td class="empty">·</td>`;
+      } else {
+        const cls = q === mask ? "low" : q >= 96 ? "skip" : "high";
+        html += `<td class="${cls}">${q}</td>`;
+      }
     }
     html += "</tr>";
   }

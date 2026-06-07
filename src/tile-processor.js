@@ -31,15 +31,16 @@ function tileImageData(imageData, sx, sy, sw, sh) {
 }
 
 /**
- * Group tiles by quality level, batch-encode each group, composite to output.
- * Returns an OffscreenCanvas with the final composited image.
+ * Encode an array of leaves (variable size 8/16/32, plus truncated edge
+ * leaves) as JPEG, batched by (size, quality). Returns an OffscreenCanvas
+ * with the final composited image. Each leaf has { x, y, w, h, quality }.
  */
-export async function processTiles(imageData, tileQualities, tileSize, onProgress) {
+export async function processTiles(imageData, leaves, onProgress) {
+  const t0 = performance.now();
   const { width, height } = imageData;
-  const tilesX = Math.ceil(width / tileSize);
-  const tilesY = Math.ceil(height / tileSize);
 
   const srcBitmap = await createImageBitmap(imageData);
+  const t1 = performance.now();
 
   const outCanvas = new OffscreenCanvas(width, height);
   const outCtx = outCanvas.getContext("2d");
@@ -47,27 +48,21 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
   const groups = new Map();
   const edgeTiles = [];
 
-  for (let ty = 0; ty < tilesY; ty++) {
-    for (let tx = 0; tx < tilesX; tx++) {
-      const tileIdx = ty * tilesX + tx;
-      const q = tileQualities[tileIdx];
-      const tileX = tx * tileSize;
-      const tileY = ty * tileSize;
-      const tileW = Math.min(tileSize, width - tileX);
-      const tileH = Math.min(tileSize, height - tileY);
+  for (const leaf of leaves) {
+    const { x, y, w, h, quality } = leaf;
 
-      if (q >= OUTPUT_QUALITY) {
-        outCtx.drawImage(srcBitmap, tileX, tileY, tileW, tileH, tileX, tileY, tileW, tileH);
-        continue;
-      }
+    if (quality >= OUTPUT_QUALITY) {
+      outCtx.drawImage(srcBitmap, x, y, w, h, x, y, w, h);
+      continue;
+    }
 
-      const tile = { tx, ty, tileX, tileY, tileW, tileH };
-      if (tileW < 8 || tileH < 8) {
-        edgeTiles.push({ ...tile, quality: q });
-      } else {
-        if (!groups.has(q)) groups.set(q, []);
-        groups.get(q).push(tile);
-      }
+    if (w < 8 || h < 8) {
+      edgeTiles.push(leaf);
+    } else {
+      const size = Math.max(w, h);
+      const key = `${size}_${quality}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(leaf);
     }
   }
 
@@ -76,12 +71,14 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
   const groupEntries = Array.from(groups);
 
   for (let gi = 0; gi < groupEntries.length; gi++) {
-    const [quality, tiles] = groupEntries[gi];
+    const [key, tiles] = groupEntries[gi];
+    const size = parseInt(key.slice(0, key.indexOf("_")), 10);
+    const quality = parseInt(key.slice(key.indexOf("_") + 1), 10);
     const n = tiles.length;
     const cols = Math.ceil(Math.sqrt(n));
     const rows = Math.ceil(n / cols);
-    const batchW = cols * tileSize;
-    const batchH = rows * tileSize;
+    const batchW = cols * size;
+    const batchH = rows * size;
 
     const batchCanvas = new OffscreenCanvas(batchW, batchH);
     const batchCtx = batchCanvas.getContext("2d");
@@ -90,10 +87,9 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
       const t = tiles[i];
       const col = i % cols;
       const row = Math.floor(i / cols);
-      batchCtx.drawImage(srcBitmap, t.tileX, t.tileY, t.tileW, t.tileH, col * tileSize, row * tileSize, t.tileW, t.tileH);
+      batchCtx.drawImage(srcBitmap, t.x, t.y, t.w, t.h, col * size, row * size, t.w, t.h);
     }
 
-    // srcBitmap not needed after the last batch's draw-to-batch-canvas loop
     if (gi === groupEntries.length - 1) srcBitmap.close();
 
     const blob = await batchCanvas.convertToBlob({ type: "image/jpeg", quality: quality / 100 });
@@ -103,18 +99,18 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
       const t = tiles[i];
       const col = i % cols;
       const row = Math.floor(i / cols);
-      outCtx.drawImage(bitmap, col * tileSize, row * tileSize, t.tileW, t.tileH, t.tileX, t.tileY, t.tileW, t.tileH);
+      outCtx.drawImage(bitmap, col * size, row * size, t.w, t.h, t.x, t.y, t.w, t.h);
     }
     bitmap.close();
 
     encodesDone++;
-    if (onProgress) onProgress(`encoding Q${quality} (${encodesDone}/${totalEncodes})`);
+    if (onProgress) onProgress(`encoding ${size}px Q${quality} (${encodesDone}/${totalEncodes})`);
   }
 
   for (const t of edgeTiles) {
-    const padded = padTo8(t.tileW, t.tileH);
-    const srcPixels = tileImageData(imageData, t.tileX, t.tileY, t.tileW, t.tileH);
-    const paddedPixels = mirrorPad(srcPixels, t.tileW, t.tileH, padded.w, padded.h);
+    const padded = padTo8(t.w, t.h);
+    const srcPixels = tileImageData(imageData, t.x, t.y, t.w, t.h);
+    const paddedPixels = mirrorPad(srcPixels, t.w, t.h, padded.w, padded.h);
     const tileCanvas = new OffscreenCanvas(padded.w, padded.h);
     const tileCtx = tileCanvas.getContext("2d");
     const id = tileCtx.createImageData(padded.w, padded.h);
@@ -122,7 +118,7 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
     tileCtx.putImageData(id, 0, 0);
     const blob = await tileCanvas.convertToBlob({ type: "image/jpeg", quality: t.quality / 100 });
     const bitmap = await createImageBitmap(blob);
-    outCtx.drawImage(bitmap, 0, 0, t.tileW, t.tileH, t.tileX, t.tileY, t.tileW, t.tileH);
+    outCtx.drawImage(bitmap, 0, 0, t.w, t.h, t.x, t.y, t.w, t.h);
     bitmap.close();
 
     encodesDone++;
@@ -130,5 +126,13 @@ export async function processTiles(imageData, tileQualities, tileSize, onProgres
   }
 
   if (groupEntries.length === 0) srcBitmap.close();
+  const tEnd = performance.now();
+  console.log(
+    `[processTiles] bitmap=${(t1-t0).toFixed(0)} ` +
+    `groups=${groups.size} ` +
+    `edges=${edgeTiles.length} ` +
+    `batchEncode=${(tEnd-t1).toFixed(0)} ` +
+    `total=${(tEnd-t0).toFixed(0)} ms`
+  );
   return outCanvas;
 }

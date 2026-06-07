@@ -1,5 +1,5 @@
 import { AdeptJPEG } from "../src/adept.js";
-import { imageDataFromURL, autoTileSize, downloadBlob } from "../src/utils.js";
+import { imageDataFromURL, downloadBlob } from "../src/utils.js";
 
 const runBtn = document.getElementById("run-btn");
 const testImageSelect = document.getElementById("test-image");
@@ -17,6 +17,7 @@ const diffInfo = document.getElementById("diff-info");
 
 let adept = null;
 let inputImageData = null;
+const ORIG_PATH = "/original/lena.q100.jpg";
 
 async function loadReferenceImages() {
   const inputPath = testImageSelect.value;
@@ -25,7 +26,7 @@ async function loadReferenceImages() {
   statusEl.textContent = "Loading reference images...";
 
   const [inputData, refResp] = await Promise.all([
-    imageDataFromURL(inputPath),
+    imageDataFromURL(ORIG_PATH),
     fetch(refPath),
   ]);
 
@@ -34,7 +35,7 @@ async function loadReferenceImages() {
   const refBlob = await refResp.blob();
   const refURL = URL.createObjectURL(refBlob);
 
-  originalImg.src = inputPath;
+  originalImg.src = ORIG_PATH;
   referenceImg.src = refURL;
   originalImg.onload = () => {
     originalInfo.textContent = `${inputData.width}×${inputData.height}`;
@@ -58,17 +59,15 @@ runBtn.addEventListener("click", async () => {
     }
 
     const { width, height } = inputImageData;
-    let tileSize = tileSizeSelect.value;
-    if (tileSize === "auto") {
-      tileSize = autoTileSize(width, height);
-    } else {
-      tileSize = parseInt(tileSize, 10);
-    }
 
-    statusEl.textContent = `Compressing with tile size ${tileSize}...`;
+    let tileSize = tileSizeSelect.value;
+    if (tileSize !== "auto") tileSize = parseInt(tileSize, 10);
+    const tileDesc = tileSize === "auto" ? "adaptive tiles" : `uniform ${tileSize}×${tileSize} tiles`;
+
+    statusEl.textContent = `Compressing with ${tileDesc}...`;
 
     const start = performance.now();
-    const resultBlob = await adept.compress(inputImageData, {
+    const result = await adept.compress(inputImageData, {
       tileSize,
       inputQuality: 100,
       onProgress: (done, total) => {
@@ -81,10 +80,10 @@ runBtn.addEventListener("click", async () => {
     });
     const elapsed = ((performance.now() - start) / 1000).toFixed(1);
 
-    const resultURL = URL.createObjectURL(resultBlob);
+    const resultURL = URL.createObjectURL(result.blob);
     resultImg.src = resultURL;
     resultImg.onload = () => {
-      resultInfo.textContent = `${resultBlob.size} B (${elapsed}s)`;
+      resultInfo.textContent = `${result.blob.size} B (${elapsed}s)`;
     };
 
     // Compute difference
@@ -112,11 +111,11 @@ runBtn.addEventListener("click", async () => {
     diffImageData.data.set(diff);
     diffCtx.putImageData(diffImageData, 0, 0);
 
-    const inputResp = await fetch(testImageSelect.value);
+    const inputResp = await fetch(ORIG_PATH);
     const inputBlob = await inputResp.blob();
     const refResp = await fetch(referenceImg.src);
     const refBlob2 = await refResp.blob();
-    const ratio = ((1 - resultBlob.size / refBlob2.size) * 100).toFixed(1);
+    const ratio = ((1 - result.blob.size / refBlob2.size) * 100).toFixed(1);
 
     diffInfo.innerHTML = `
       MSE: ${mse.toFixed(1)} |

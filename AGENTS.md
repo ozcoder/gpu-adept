@@ -8,6 +8,7 @@ Adaptive JPEG compressor using WebGPU.
 npm install          # installs Vite
 npm run dev          # Vite dev server, opens demo/index.html
 npm run build        # production build
+node test/quadtree.test.mjs  # pure-JS unit tests for quadtree + quality helpers
 ```
 
 Open `/demo/` for the demo, `/test/validate.html` for validation against reference.
@@ -62,14 +63,16 @@ Browser-only. Uses Vite, WebGPU compute, and Canvas 2D APIs.
 | Path | Role |
 |---|---|
 | `src/adept.js` | `AdeptJPEG` class — `create()`, `compress(imageData, opts)`, `destroy()`. Owns device + `SaliencyPipeline`. |
-| `src/pipeline.js` | `SaliencyPipeline` — unified GPU pipeline. `setup()`, `computeSaliency()` (histogram readback), `analyzeTiles()` (tile means readback). |
+| `src/pipeline.js` | `SaliencyPipeline` — unified GPU pipeline. `setup()`, `computeSaliency()` (histogram readback), `analyzeTiles()` (8×8 tile means readback). |
+| `src/quadtree.js` | `buildAdaptiveTiles()` (bottom-up quadtree from 8×8 means → 8/16/32 leaves) and `buildUniformTiles()` (uniform N×N leaves, N multiple of 8). |
 | `src/shaders.js` | All WGSL shaders: saliency pipeline (RGB→Lab, Gaussian blur, integral images, saliency, reduce, normalize) + histogram + tile analysis. |
-| `src/tile-processor.js` | `processTiles()` — groups tiles by quality level, encodes each group as a batch OffscreenCanvas (≤16 `toBlob` calls total). Edge tiles padded individually. |
+| `src/tile-processor.js` | `processTiles()` — groups leaves by (size, quality), encodes each group as a batch OffscreenCanvas. Edge tiles padded individually. |
 | `src/utils.js` | `imageDataFromFile`, `autoTileSize`, `tileCount`, `padTo8`, `downloadBlob`. |
 | `demo/demo.js` | Demo controller — drag-and-drop, tile size selector, progress, download. |
 | `demo/index.html` | Demo page (referenced from root `index.html`). |
 | `test/validate.html` | Validation page — compares gpu-adept output to reference ImageMagick output. |
 | `test/validate.js` | Validation logic — loads test images, runs pipeline, computes MSE + size ratio. |
+| `test/quadtree.test.mjs` | Node unit tests for `buildAdaptiveTiles`, `buildUniformTiles`, `snapQuality`, `findOptimalThreshold`. Run with `node test/quadtree.test.mjs`. |
 | `original/` | Reference bash script + test images. Untouched. |
 
 ## Key implementation details
@@ -77,12 +80,14 @@ Browser-only. Uses Vite, WebGPU compute, and Canvas 2D APIs.
 - **Saliency pipeline**: RGB→Lab, 3×3 Gaussian blur, integral images via segmented scan (256-wide segments, **Blelloch parallel scan in shared memory**), saliency = squared Lab difference from local mean, tree-reduction for global min/max, normalize to 0–255 + atomic histogram in a single pass.
 - **Histogram**: 256-bin atomic counters accumulated alongside the normalize pass. Readback is 1 KB regardless of image size.
 - **Binary search**: CPU-side on histogram bins (not full image). Target b/w mean between 20–40 (0–255 scale).
-- **Tile analysis shader**: Workgroup (8,8) = 64 threads per tile. Each thread handles `ceil(tileSize/8)²` pixels. Vec4 load with per-pixel fallback. Tree reduction via `var<workgroup>` shared memory (64-element sum + count).
-- **Batch encode**: Tiles grouped by quality level. All tiles at the same quality are packed into one OffscreenCanvas → `toBlob` once → decoded → distributed to output. At most 16 encodes for any image size.
+- **Tile analysis shader**: Workgroup (8,8) = 64 threads per tile. Always analyzes at 8×8. Vec4 load with per-pixel fallback (vec4 path inactive for 8×8). Tree reduction via `var<workgroup>` shared memory (64-element sum + count).
+- **Adaptive tiling (quadtree)**: 8×8 means feed `buildAdaptiveTiles` which bottom-up merges: keep a 32×32 region as one leaf only if all 16 8×8 children are non-salient, else subdivide into four 16×16; subdivide each 16×16 similarly. Yields variable-size leaves (8, 16, or 32) covering the image with no overlap. Each leaf gets a quality snapped to one of 16 discrete levels.
+- **Uniform tiling**: When `opts.tileSize` is a number (8, 16, 32, 64, 128, 256), `buildUniformTiles` aggregates the 8×8 means within each N×N tile (mean of constituent means) and emits one leaf per tile. The 8×8 analysis pass is unchanged.
+- **Batch encode**: Leaves grouped by (size, quality). All leaves of the same size and quality are packed into one OffscreenCanvas (cell stride = size) → `toBlob` once → decoded → distributed to output. Up to 3 × 16 = 48 encodes for any image size.
 - **Edge tiles**: Tiles < 8px in any dimension are mirror-padded to 8×8 before JPEG encode, cropped after decode. Handled individually (at most `tilesX + tilesY - 1` such tiles).
 - **Quality levels**: 16 discrete levels from 64 to 94 (step 2). Level 96 means "skip encode" — original pixels used directly.
 - **Output**: Final composite encoded at Q96.
-- **Tile size**: Auto-detect: ≤512px → 8, ≤1024px → 16, >1024px → 32. User override via `opts.tileSize`.
+- **Tile size**: Always analyzed at 8×8. `opts.tileSize` selects leaf sizing: `'auto'` (default) → adaptive quadtree (8/16/32); a number (8, 16, 32, 64, 128, 256) → uniform N×N tiles.
 
 ## Reference algorithm
 

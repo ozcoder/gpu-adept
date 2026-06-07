@@ -4,8 +4,6 @@ const SAL_STRUCT = `
 struct SalParams {
   width: u32,
   height: u32,
-  maxVal: f32,
-  minVal: f32,
   numSegX: u32,
   numSegY: u32,
 };
@@ -16,8 +14,6 @@ const SAL_BIND = {
   in:   `@group(0) @binding(1) var<storage, read> input: array<u32>;`,
   lab:  `@group(0) @binding(1) var<storage, read> lab: array<vec4<f32>>;`,
   labW: `@group(0) @binding(1) var<storage, read_write> lab: array<vec4<f32>>;`,
-  tmp:  `@group(0) @binding(1) var<storage, read> temp: array<vec4<f32>>;`,
-  tmpW: `@group(0) @binding(1) var<storage, read_write> temp: array<vec4<f32>>;`,
   blr:  `@group(0) @binding(1) var<storage, read> blurred: array<vec4<f32>>;`,
   blrW: `@group(0) @binding(1) var<storage, read_write> blurred: array<vec4<f32>>;`,
   intW: `@group(0) @binding(1) var<storage, read_write> integral: array<vec4<f32>>;`,
@@ -32,7 +28,6 @@ const SAL_BIND = {
 
   // binding 2
   labW2: `@group(0) @binding(2) var<storage, read_write> lab: array<vec4<f32>>;`,
-  tmpW2: `@group(0) @binding(2) var<storage, read_write> temp: array<vec4<f32>>;`,
   blrW2: `@group(0) @binding(2) var<storage, read_write> blurred: array<vec4<f32>>;`,
   intW2: `@group(0) @binding(2) var<storage, read_write> integral: array<vec4<f32>>;`,
   int2:  `@group(0) @binding(2) var<storage, read> integral: array<vec4<f32>>;`,
@@ -53,6 +48,13 @@ const SAL_BIND = {
   // binarize
   outR:  `@group(0) @binding(1) var<storage, read> output: array<u32>;`,
   bwW:   `@group(0) @binding(2) var<storage, read_write> bwOut: array<u32>;`,
+
+  // binding 4 — atomic min/max
+  // temp buffer for gaussianX→gaussianY
+  tmpR: `@group(0) @binding(1) var<storage, read> tmp: array<vec4<f32>>;`,
+  tmpW: `@group(0) @binding(2) var<storage, read_write> tmp: array<vec4<f32>>;`,
+
+  mm4: `@group(0) @binding(4) var<storage, read_write> globalMinMax: array<atomic<u32>>;`,
 };
 
 export const RGB2LAB = `
@@ -99,7 +101,7 @@ export const GAUSSIAN_X = `
 ${SAL_STRUCT}
 ${SAL_BIND.p}
 ${SAL_BIND.lab}
-${SAL_BIND.tmpW2}
+${SAL_BIND.tmpW}
 
 @compute @workgroup_size(16, 16)
 fn gaussianX(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -111,14 +113,14 @@ fn gaussianX(@builtin(global_invocation_id) id: vec3<u32>) {
   var ksum = 2.0;
   if (x > 0u) { sum += lab[idx - 1u]; ksum += 1.0; }
   if (x + 1u < p.width) { sum += lab[idx + 1u]; ksum += 1.0; }
-  temp[idx] = sum / ksum;
+  tmp[idx] = sum / ksum;
 }
 `;
 
 export const GAUSSIAN_Y = `
 ${SAL_STRUCT}
 ${SAL_BIND.p}
-${SAL_BIND.tmp}
+${SAL_BIND.tmpR}
 ${SAL_BIND.blrW2}
 
 @compute @workgroup_size(16, 16)
@@ -127,10 +129,10 @@ fn gaussianY(@builtin(global_invocation_id) id: vec3<u32>) {
   let y = id.y;
   if (x >= p.width || y >= p.height) { return; }
   let idx = y * p.width + x;
-  var sum = temp[idx] * 2.0;
+  var sum = tmp[idx] * 2.0;
   var ksum = 2.0;
-  if (y > 0u) { sum += temp[(y - 1u) * p.width + x]; ksum += 1.0; }
-  if (y + 1u < p.height) { sum += temp[(y + 1u) * p.width + x]; ksum += 1.0; }
+  if (y > 0u) { sum += tmp[idx - p.width]; ksum += 1.0; }
+  if (y + 1u < p.height) { sum += tmp[idx + p.width]; ksum += 1.0; }
   blurred[idx] = sum / ksum;
 }
 `;
@@ -345,6 +347,7 @@ ${SAL_BIND.p}
 ${SAL_BIND.blr}
 ${SAL_BIND.int2}
 ${SAL_BIND.sal3}
+${SAL_BIND.mm4}
 
 fn getIntegralSum(x1: u32, y1: u32, x2: u32, y2: u32) -> vec4<f32> {
   let a = integral[y2 * p.width + x2];
@@ -370,42 +373,11 @@ fn computeSaliency(@builtin(global_invocation_id) id: vec3<u32>) {
   let meanLab = getIntegralSum(x1, y1, x2, y2) / area;
   let pixLab  = blurred[idx];
   let diff    = meanLab - pixLab;
-  saliency[idx] = dot(diff, diff);
-}
-`;
-
-export const REDUCE_MAX = `
-${SAL_STRUCT}
-${SAL_BIND.p}
-${SAL_BIND.sal}
-${SAL_BIND.mx2}
-
-var<workgroup> shMin: array<f32, 256>;
-var<workgroup> shMax: array<f32, 256>;
-
-@compute @workgroup_size(256)
-fn reduceMax(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
-  let total = p.width * p.height;
-  let idx = id.x;
-  if (idx < total) {
-    let v = saliency[idx];
-    shMin[lid.x] = v;
-    shMax[lid.x] = v;
-  } else {
-    shMin[lid.x] = 1.0e30;
-    shMax[lid.x] = -1.0;
-  }
-  workgroupBarrier();
-  for (var d = 128u; d > 0u; d /= 2u) {
-    if (lid.x < d) {
-      shMin[lid.x] = min(shMin[lid.x], shMin[lid.x + d]);
-      shMax[lid.x] = max(shMax[lid.x], shMax[lid.x + d]);
-    }
-    workgroupBarrier();
-  }
-  if (lid.x == 0u) {
-    maxVals[wg.x] = vec2(shMin[0], shMax[0]);
-  }
+  let val = dot(diff, diff);
+  saliency[idx] = val;
+  let bits = bitcast<u32>(val);
+  atomicMin(&globalMinMax[0], bits);
+  atomicMax(&globalMinMax[1], bits);
 }
 `;
 
@@ -415,6 +387,7 @@ ${SAL_BIND.p}
 ${SAL_BIND.sal}
 ${SAL_BIND.out2}
 ${SAL_BIND.hist3}
+${SAL_BIND.mm4}
 
 @compute @workgroup_size(16, 16)
 fn normalizeHist(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -422,8 +395,12 @@ fn normalizeHist(@builtin(global_invocation_id) id: vec3<u32>) {
   let y = id.y;
   if (x >= p.width || y >= p.height) { return; }
   let idx = y * p.width + x;
-  let range = p.maxVal - p.minVal;
-  let s = select(0.0, (saliency[idx] - p.minVal) / range, range > 0.0);
+  let bitsMin = atomicLoad(&globalMinMax[0]);
+  let bitsMax = atomicLoad(&globalMinMax[1]);
+  let fMin = bitcast<f32>(bitsMin);
+  let fMax = bitcast<f32>(bitsMax);
+  let range = fMax - fMin;
+  let s = select(0.0, (saliency[idx] - fMin) / range, range > 0.0);
   let val = u32(clamp(s * 255.0, 0.0, 255.0));
   output[idx] = val | (val << 8u) | (val << 16u) | (255u << 24u);
   atomicAdd(&hist[val], 1u);
