@@ -46,6 +46,9 @@ export class SaliencyPipeline {
 
   setup(width, height, tileSize, initialData) {
     this.destroy();
+    if (!(width > 0 && height > 0)) {
+      throw new Error(`Invalid image dimensions: ${width}×${height}`);
+    }
     const device = this.device;
     const pixelCount = width * height;
     const numSegX = Math.max(1, Math.ceil(width / 256));

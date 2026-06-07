@@ -32,24 +32,43 @@ dropZone.addEventListener("dragleave", () => {
   dropZone.classList.remove("dragover");
 });
 
+function resetUI() {
+  preview.style.display = "none";
+  preview.src = "";
+  dropZone.classList.remove("has-image");
+  controls.classList.remove("visible");
+  compressBtn.disabled = true;
+  result.classList.remove("visible");
+  debugTable.classList.remove("visible");
+}
+
 dropZone.addEventListener("drop", (e) => {
   e.preventDefault();
   dropZone.classList.remove("dragover");
   const file = e.dataTransfer.files[0];
-  if (file && file.type.startsWith("image/")) {
-    loadImage(file);
+  if (!file) return;
+  if (!file.type.startsWith("image/")) {
+    statusEl.textContent = `"${file.name}" is not a supported image (type: ${file.type || "unknown"})`;
+    return;
   }
+  loadImage(file);
 });
 
 fileInput.addEventListener("change", () => {
-  if (fileInput.files[0]) {
-    loadImage(fileInput.files[0]);
-  }
+  const file = fileInput.files[0];
+  if (file) loadImage(file);
 });
 
 async function loadImage(file) {
+  resetUI();
   currentFile = file;
-  currentImageData = await imageDataFromFile(file);
+  currentImageData = null;
+  try {
+    currentImageData = await imageDataFromFile(file);
+  } catch (err) {
+    statusEl.textContent = `Error loading ${file.name}: ${err.message}`;
+    return;
+  }
 
   const url = URL.createObjectURL(file);
   preview.src = url;

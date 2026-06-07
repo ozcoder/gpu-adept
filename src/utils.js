@@ -1,7 +1,18 @@
+const MAX_IMAGE_DIM = 8192;
+
 export function imageDataFromFile(file) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
+      URL.revokeObjectURL(img.src);
+      if (img.width === 0 || img.height === 0) {
+        reject(new Error(`Image has zero dimensions (${img.width}×${img.height})`));
+        return;
+      }
+      if (img.width > MAX_IMAGE_DIM || img.height > MAX_IMAGE_DIM) {
+        reject(new Error(`Image dimensions (${img.width}×${img.height}) exceed maximum allowed (${MAX_IMAGE_DIM}×${MAX_IMAGE_DIM})`));
+        return;
+      }
       const canvas = document.createElement("canvas");
       canvas.width = img.width;
       canvas.height = img.height;
@@ -9,7 +20,10 @@ export function imageDataFromFile(file) {
       ctx.drawImage(img, 0, 0);
       resolve(ctx.getImageData(0, 0, img.width, img.height));
     };
-    img.onerror = reject;
+    img.onerror = () => {
+      URL.revokeObjectURL(img.src);
+      reject(new Error("Failed to decode image"));
+    };
     img.src = URL.createObjectURL(file);
   });
 }
